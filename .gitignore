@@ -1,0 +1,21 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
