@@ -29,27 +29,25 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------- logging
-# Never log message content, tokens or keys. Only event types and counts.
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-# httpx logs full request URLs, and Telegram URLs contain the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("stf-support")
 
 # ----------------------------------------------------------------- config
-BOT_NAME = "STF SUPPORT TEAM"  # fixed; users cannot change it
+BOT_NAME = "STF SUPPORT TEAM"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
-MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip()
+MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free").strip()
 
-# Do not exit at import time (helps tests). Validate at runtime in main().
+# Do not exit at import time; validate at runtime in main().
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
-    log.warning("BOT_TOKEN and OPENROUTER_API_KEY environment variables are not set. Runtime will fail unless provided.")
+    log.warning("BOT_TOKEN and OPENROUTER_API_KEY are not configured yet.")
 
 try:
     ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else None
@@ -60,16 +58,15 @@ if ADMIN_ID is None:
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-IDLE_TIMEOUT = 5 * 60        # seconds of inactivity before context is erased
-CLEANUP_INTERVAL = 30        # seconds between cleanup passes
-MAX_HISTORY = 8              # messages kept per user (RAM only)
+IDLE_TIMEOUT = 5 * 60
+CLEANUP_INTERVAL = 30
+MAX_HISTORY = 8
 MAX_INPUT_CHARS = 1000
 MAX_REPLY_CHARS = 3500
-RATE_LIMIT_COUNT = 5         # messages allowed ...
-RATE_LIMIT_WINDOW = 60       # ... per this many seconds, per user
+RATE_LIMIT_COUNT = 5
+RATE_LIMIT_WINDOW = 60
 STARTED_AT = time.time()
 
-# SYSTEM PROMPT now enforces Hinglish and strict support-only behaviour.
 SYSTEM_PROMPT = (
     f"You are the automated assistant of {BOT_NAME}, a customer support bot on Telegram.\n"
     "Rules:\n"
@@ -78,22 +75,20 @@ SYSTEM_PROMPT = (
     "Keep commands, error codes, product names, and official technical identifiers unchanged where necessary.\n"
     "- Only help with customer-support topics: troubleshooting, explaining how to report a problem, and guiding the user to the official support team.\n"
     "- You have NO access to accounts, orders, payments or internal systems. Never claim to look anything up or change anything.\n"
-    "- Never invent company policies, prices, refund rules, timelines, account details or contact details. If you do not have verified information, say so and tell the user to contact the official support administrator.\n"
+    "- Never invent company policies, prices, refund rules, timelines, account details, server addresses, account status, or contact details. If you do not have verified information, say so and tell the user to contact the official support administrator.\n"
     "- Never ask for passwords, OTPs, PINs, card numbers, API keys or tokens. Tell users never to share them.\n"
     "- If the request is outside support (general chat, coding, writing, roleplay, opinions, etc.), politely decline and redirect to the official support team. Ask the user to describe a support issue.\n"
     "- Keep replies short, polite, plain text, and in Hinglish."
 )
 
-# Messages that look like they contain secrets are NOT sent to the AI or stored.
 SECRET_PATTERNS = [
-    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                 # Telegram bot token
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),                        # API-key style
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\b(otp|cvv|pin)\b\s*(is|=|:)?\s*\d{4,8}\b", re.I),
     re.compile(r"\b(password|passcode)\s*(=|:)\s*\S+", re.I),
 ]
 
 
-# ------------------------------------------------------------ RAM storage
 @dataclass
 class Session:
     history: list = field(default_factory=list)
@@ -122,7 +117,6 @@ def rate_limited(user_id: int) -> bool:
     return False
 
 
-# ------------------------------------------------------------------ utils
 def is_admin(user_id: int) -> bool:
     return ADMIN_ID is not None and user_id == ADMIN_ID
 
@@ -132,7 +126,6 @@ def contains_secret(text: str) -> bool:
 
 
 def clean_reply(text: str) -> str:
-    """Redact our own credentials if the model ever echoes them, and cap length."""
     if not isinstance(text, str):
         text = str(text)
     for secret in (BOT_TOKEN, OPENROUTER_API_KEY):
@@ -150,7 +143,7 @@ async def safe_reply(update: Update, text: str) -> None:
         log.warning("Failed to send reply: %s", type(exc).__name__)
 
 
-# ---------------------------------------------------------- heuristics & canned replies
+# ---------------------------------------------------------------- heuristics & canned support replies
 CASUAL_PATTERNS = [
     r"^hi\b",
     r"^hello\b",
@@ -170,21 +163,34 @@ def is_casual_message(text: str) -> bool:
     return bool(CASUAL_RE.search(text))
 
 
+def message_has_image(message) -> bool:
+    if not message:
+        return False
+    if getattr(message, "photo", None):
+        return True
+    doc = getattr(message, "document", None)
+    if doc and getattr(doc, "mime_type", "").startswith("image"):
+        return True
+    return False
+
+
 def is_mt5_question(text: str) -> bool:
     if not text:
         return False
     t = text.lower()
-    return ("metatrader" in t or "mt5" in t) and ("connect" in t or "connect kaise" in t or "connect kaise karun" in t or "se connect" in t or "connect kar" in t or "login" in t)
+    return ("metatrader" in t or "mt5" in t) and (
+        "connect" in t or "connect kaise" in t or "connect kar" in t or "login" in t or "se connect" in t
+    )
 
 
 def mt5_canned_reply_hinglish() -> str:
     return (
-        "Yeh steps follow karo to connect MetaTrader 5 account:\n"
+        "MetaTrader 5 se connect karne ke liye yeh steps follow karo:\n"
         "1) MetaTrader 5 app open karo.\n"
-        "2) 'Login to an existing account' ya 'Login' option dhoondo.\n"
-        "3) Broker ne jo login/account number diya hai, woh enter karo, uska password aur correct server select karo.\n"
-        "4) Server details aapke broker se milti hain — broker hi correct server batayega. Agar aapko server ka naam nahi pata, toh pehle batao kaunsa broker use kar rahe ho.\n"
-        "5) Kabhi apna password, OTP ya sensitive details yahan mat bhejo. Agar login fail ho, broker support se server or account details confirm karo."
+        "2) 'Login to an existing account' ya 'Login' option select karo.\n"
+        "3) Broker ne diya hua login/account number, password, aur correct server enter karo.\n"
+        "4) Correct server broker hi provide karta hai. Agar server unknown hai, toh pehle batao kaunsa broker use kar rahe ho.\n"
+        "5) Kabhi bhi apna password, OTP, ya sensitive details Telegram mein share mat karo."
     )
 
 
@@ -194,20 +200,12 @@ class AIError(Exception):
 
 
 def model_supports_vision_heuristic(model_name: str) -> bool:
-    """Best-effort heuristic to determine whether the configured model supports
-    image/vision inputs.
-    """
     n = model_name.lower()
     keys = ["vl", "vision", "gemini", "flash", "multimodal", "image", "img"]
     return any(k in n for k in keys)
 
 
 async def get_model_capability(client: httpx.AsyncClient, model_name: str, timeout: float = 6.0) -> Tuple[Optional[Dict[str, Any]], Optional[bool]]:
-    """Query the OpenRouter models endpoint and try to find the named model.
-    Returns (model_info, supports_vision) where model_info is the raw model object
-    or None if not found / on error, and supports_vision is True/False if
-    determinable, otherwise None.
-    """
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"} if OPENROUTER_API_KEY else {}
     try:
         resp = await client.get(OPENROUTER_MODELS_URL, headers=headers, timeout=timeout)
@@ -229,14 +227,12 @@ async def get_model_capability(client: httpx.AsyncClient, model_name: str, timeo
     if not isinstance(data, list):
         return None, None
 
-    # Try to match model by id or name
     target = model_name.lower()
     for m in data:
         mid = (m.get("id") or "").lower()
         name = (m.get("name") or "").lower()
         desc = (m.get("description") or "").lower()
         if target == mid or target in mid or target in name or target in desc:
-            # Determine vision support from fields if possible
             modalities = m.get("modalities") or m.get("input") or m.get("capabilities")
             if isinstance(modalities, list):
                 has_vision = any("image" in str(x).lower() or "vision" in str(x).lower() for x in modalities)
@@ -249,14 +245,13 @@ async def get_model_capability(client: httpx.AsyncClient, model_name: str, timeo
 
 
 async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
-    """Call OpenRouter with messages. Validate response language (Hinglish) and retry once if necessary."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {"model": MODEL, "messages": messages, "max_tokens": 600}
 
-    async def _call():
+    async def _call_once() -> str:
         max_retries = 4
         backoff = 1.0
         last_error = "unknown"
@@ -288,7 +283,6 @@ async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
                     backoff *= 2
                     continue
 
-                # Expecting choices -> message -> content
                 try:
                     choices = data.get("choices")
                     if not choices:
@@ -310,7 +304,6 @@ async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
                     backoff *= 2
                     continue
 
-                # content may be a string, or a list of content objects for multimodal
                 if isinstance(content, str):
                     if content.strip():
                         return content.strip()
@@ -320,7 +313,6 @@ async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
                     continue
 
                 if isinstance(content, list):
-                    # collect text pieces
                     parts = []
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text":
@@ -341,10 +333,8 @@ async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
                 backoff *= 2
                 continue
 
-            # Non-200 handling
             last_error = f"HTTP {status}"
             if status in (401, 402, 403, 404):
-                # Permanent authorization / model not found errors: do not retry
                 log.error("OpenRouter permanent error: %s", last_error)
                 break
 
@@ -372,40 +362,36 @@ async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
 
         raise AIError(last_error)
 
-    # First call
-    text = await _call()
+    text = await _call_once()
 
-    # Validate Hinglish: reject Devanagari and retry once if invalid
     def _is_valid_hinglish(s: str) -> bool:
-        # reject Devanagari/Hindi script characters
         if re.search(r"[\u0900-\u097F]", s):
             return False
-        # simple heuristic: must contain at least one Hindi-roman token or be short
         tokens = re.findall(r"\w+", s.lower())
-        hinglish_tokens = {"kaise", "ka", "kya", "hai", "nahi", "karo", "kar", "login", "server", "broker", "account", "password", "otp"}
+        hinglish_tokens = {
+            "kaise", "ka", "kya", "hai", "nahi", "karo", "kar", "login", "server",
+            "broker", "account", "password", "otp", "error", "support", "issue"
+        }
         if any(t in hinglish_tokens for t in tokens):
             return True
-        # allow very short replies
         if len(tokens) <= 6:
             return True
         return False
 
     if not _is_valid_hinglish(text):
         log.info("AI reply failed Hinglish validation; retrying once with stronger hint")
-        # inject a stronger instruction at start of system prompt
-        messages_copy = []
+        retry_messages = []
         for m in messages:
             if m.get("role") == "system":
-                messages_copy.append({"role": "system", "content": SYSTEM_PROMPT + "\nALWAYS REPLY IN HINGLISH IN ROMAN SCRIPT."})
+                retry_messages.append({"role": "system", "content": SYSTEM_PROMPT + "\nALWAYS REPLY IN HINGLISH IN ROMAN SCRIPT."})
             else:
-                messages_copy.append(m)
+                retry_messages.append(m)
         try:
-            text2 = await _call()
+            text2 = await _call_once()
             if _is_valid_hinglish(text2):
                 return text2
         except AIError:
             pass
-        # If still invalid, return the original but mark it cleaned
     return text
 
 
@@ -414,8 +400,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(
         update,
         f"Welcome to {BOT_NAME}! 🛟\n\n"
-        "Main support-only bot hoon — batao kya issue hai, ya screenshot bhejo caption ke saath.\n"
-        "Safety: kabhi apna password, OTP, PIN yahan mat bhejo.\n\n"
+        "Main support-only bot hoon — batao aapko kis issue mein help chahiye.\n"
+        "Screenshot bhejo caption ke saath.\n"
+        "Safety: kabhi password, OTP, PIN ya API keys yahan mat bhejo.\n\n"
         "Type /help for commands.",
     )
 
@@ -428,9 +415,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - this message\n"
         "/clear - erase our current conversation\n"
         "/status - check if the bot is online\n\n"
-        "Support karo: apna issue short mein batao ya screenshot bhejo.\n"
+        "Support issue ko short mein batao ya screenshot bhejo.\n"
         "Conversation memory 5 minutes tak hoti hai.\n"
-        "Main aapka account access nahi kar sakta — account-specific help ke liye broker/official support se contact karo.",
+        "Main account aapka access nahi kar sakta — account-specific help ke liye official support se contact karo.",
     )
 
 
@@ -470,10 +457,6 @@ async def on_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def build_user_message_for_openrouter(text: Optional[str], image_data_url: Optional[str]):
-    """Return a message content structure compatible with OpenRouter when
-    including optional image data. If only text is provided, returns the text
-    as a simple string to preserve backwards compatibility.
-    """
     if image_data_url:
         content = []
         if text:
@@ -488,41 +471,29 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
 
-    # handle rate limiting early
     if rate_limited(user_id):
-        await safe_reply(update, "Aap jaldi messages bhej rahe ho. Thoda ruk ke phir try karo.")
+        await safe_reply(update, "Aap jaldi messages bhej rahe ho. Thoda ruk ke try karo.")
         return
 
-    # extract text and possible caption
     text = (update.message.text or update.message.caption or "").strip()
-    photo = None
-    doc = None
-    image_data_url = None
+    has_image = message_has_image(update.message)
 
-    if getattr(update.message, "photo", None):
-        photo = update.message.photo[-1]
-    elif getattr(update.message, "document", None) and getattr(update.message.document, "mime_type", "").startswith("image"):
-        doc = update.message.document
-
-    # secrets check
     if contains_secret(text):
         await safe_reply(
             update,
-            "⚠️ Yeh message kisi secret jaisa lagta hai (password/OTP). Maine isse process nahi kiya. Sensitive info yahan mat bhejo.",
+            "⚠️ Yeh message kis secret jaisa lagta hai (password/OTP). Maine isse process nahi kiya. Sensitive info yahan mat bhejo.",
         )
         return
 
-    # Catch MetaTrader 5 question with a canned, safe Hinglish reply
     if is_mt5_question(text):
         await safe_reply(update, mt5_canned_reply_hinglish())
         return
 
-    # Casual chat redirection
     if is_casual_message(text):
-        await safe_reply(update, "Hi! Main support bot hoon — batao kya support issue hai jispar main help kar sakun?")
+        await safe_reply(update, "Hi! Main support bot hoon — batao aapko kis support issue mein help chahiye.")
         return
 
-    if not text and not photo and not doc:
+    if not text and not has_image:
         await safe_reply(update, "Please apna support issue short mein batao ya screenshot bhejo caption ke saath.")
         return
 
@@ -535,25 +506,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Pehle wale message pe kaam chal raha hai. Thoda intezaar karo.")
         return
 
-    # Image handling only when an image is actually present
-    if photo or doc:
-        # Check model capability: prefer authoritative info if available
+    image_data_url = None
+    if has_image:
         ms = context.application.bot_data.get("model_supports_vision")
         if ms is None:
             try:
-                info, cap = await get_model_capability(context.application.bot_data["http"], MODEL)
-                context.application.bot_data["model_info"] = info
+                _, cap = await get_model_capability(context.application.bot_data["http"], MODEL)
                 context.application.bot_data["model_supports_vision"] = cap if cap is not None else model_supports_vision_heuristic(MODEL)
                 ms = context.application.bot_data["model_supports_vision"]
             except Exception:
                 ms = model_supports_vision_heuristic(MODEL)
         if not ms:
-            await safe_reply(update, "Yeh model image analyze nahi kar sakta. Agar aap image bhejte ho toh model ko vision-capable set karo ya text mein problem batao.")
+            await safe_reply(update, "Yeh model image analyze nahi kar sakta. Image ke liye vision-capable model use karo ya text mein apna issue likho.")
             return
 
-        # download image
-        file = await (photo.get_file() if photo else doc.get_file())
-        max_bytes = 5 * 1024 * 1024  # 5 MB
+        photo = update.message.photo[-1] if getattr(update.message, "photo", None) else None
+        document = update.message.document if getattr(update.message, "document", None) else None
+        file = await (photo.get_file() if photo else document.get_file())
+        max_bytes = 5 * 1024 * 1024
         if getattr(file, "file_size", 0) and file.file_size > max_bytes:
             await safe_reply(update, "Image size zyada hai. Kripya chhota screenshot bhejo (5 MB se kam).")
             return
@@ -563,7 +533,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio.seek(0)
             data = bio.read()
             if len(data) > max_bytes:
-                await safe_reply(update, "Image size zyada hai baad mein. Chhota image bhejo.")
+                await safe_reply(update, "Image size zyada hai. Chhota image bhejo.")
                 return
             mime = "image/jpeg"
             if data.startswith(b"\x89PNG"):
@@ -575,10 +545,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(update, "Image download mein problem aayi. Dobara try karo.")
             return
 
-    # Build conversation and call AI
     async with session.lock:
-        placeholder = text or "[screenshot]"
-        session.history.append({"role": "user", "content": placeholder})
+        session.history.append({"role": "user", "content": text or "[screenshot]"})
         session.history = session.history[-MAX_HISTORY:]
         session.last_active = time.time()
 
@@ -600,7 +568,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "429" in err or "rate" in err.lower():
                 await safe_reply(update, "AI service temporarily rate-limited hai. Thode der baad try karo.")
             elif "404" in err or "not found" in err.lower():
-                await safe_reply(update, "Configured model nahi mila. Admin se OPENROUTER_MODEL check karne kehdo.")
+                await safe_reply(update, "Configured model nahi mila. Admin se OPENROUTER_MODEL verify karo.")
             elif "401" in err or "403" in err:
                 await safe_reply(update, "AI service authentication fail hui. Admin ko inform karo.")
             else:
@@ -626,11 +594,7 @@ async def cleanup_loop():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL)
         now = time.time()
-        expired = [
-            uid
-            for uid, s in sessions.items()
-            if now - s.last_active > IDLE_TIMEOUT and not s.lock.locked()
-        ]
+        expired = [uid for uid, s in sessions.items() if now - s.last_active > IDLE_TIMEOUT and not s.lock.locked()]
         for uid in expired:
             sessions.pop(uid, None)
         for uid in [u for u, q in rate_log.items() if not q or now - q[-1] > RATE_LIMIT_WINDOW]:
@@ -642,10 +606,8 @@ async def cleanup_loop():
 async def post_init(app: Application):
     app.bot_data["http"] = httpx.AsyncClient()
     try:
-        info, cap = await get_model_capability(app.bot_data["http"], MODEL)
-        app.bot_data["model_info"] = info
+        _, cap = await get_model_capability(app.bot_data["http"], MODEL)
         app.bot_data["model_supports_vision"] = cap if cap is not None else model_supports_vision_heuristic(MODEL)
-        log.info("Model capability loaded: vision=%s", app.bot_data.get("model_supports_vision"))
     except Exception:
         app.bot_data["model_supports_vision"] = model_supports_vision_heuristic(MODEL)
     app.bot_data["cleanup"] = asyncio.create_task(cleanup_loop())
@@ -675,17 +637,15 @@ def main():
         .build()
     )
 
-    private = filters.ChatType.PRIVATE  # private chats only
+    private = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler("start", cmd_start, filters=private))
     app.add_handler(CommandHandler("help", cmd_help, filters=private))
     app.add_handler(CommandHandler("clear", cmd_clear, filters=private))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
-    # Accept text, captions, photos and image documents as support input
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(MessageHandler(private & filters.PHOTO, on_message))
     app.add_handler(MessageHandler(private & filters.Document.IMAGE, on_message))
     app.add_handler(MessageHandler(private & filters.COMMAND, on_unknown_command))
-    # Any other non-text updates get a helpful note
     app.add_handler(
         MessageHandler(
             private & ~filters.TEXT & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
@@ -694,9 +654,7 @@ def main():
     )
     app.add_error_handler(on_error)
 
-    # Only call polling once per process. If you deploy multiple Railway replicas,
-    # each will start its own polling instance; set replicas to 1 in Railway to
-    # avoid Telegram 'Conflict' errors.
+    # One polling instance only per process; Railway replicas must be 1.
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
