@@ -14,7 +14,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from telegram import Update
@@ -47,9 +47,9 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "").strip()
 MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip()
 
+# Do not exit at import time (helps tests). Validate at runtime in main().
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
-    log.error("BOT_TOKEN and OPENROUTER_API_KEY environment variables are required.")
-    sys.exit(1)
+    log.warning("BOT_TOKEN and OPENROUTER_API_KEY environment variables are not set. Runtime will fail unless provided.")
 
 try:
     ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else None
@@ -59,6 +59,7 @@ if ADMIN_ID is None:
     log.warning("ADMIN_ID missing or invalid; admin-only features are disabled.")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 IDLE_TIMEOUT = 5 * 60        # seconds of inactivity before context is erased
 CLEANUP_INTERVAL = 30        # seconds between cleanup passes
 MAX_HISTORY = 8              # messages kept per user (RAM only)
@@ -158,15 +159,61 @@ class AIError(Exception):
     pass
 
 
-def model_supports_vision(model_name: str) -> bool:
+def model_supports_vision_heuristic(model_name: str) -> bool:
     """Best-effort heuristic to determine whether the configured model supports
-    image/vision inputs. We avoid calling additional APIs at startup to keep the
-    code simple and resilient; if this heuristic is wrong the request will fail
-    and be reported back to the user.
+    image/vision inputs.
     """
     n = model_name.lower()
     keys = ["vl", "vision", "gemini", "flash", "multimodal", "image", "img"]
     return any(k in n for k in keys)
+
+
+async def get_model_capability(client: httpx.AsyncClient, model_name: str, timeout: float = 6.0) -> Tuple[Optional[Dict[str, Any]], Optional[bool]]:
+    """Query the OpenRouter models endpoint and try to find the named model.
+    Returns (model_info, supports_vision) where model_info is the raw model object
+    or None if not found / on error, and supports_vision is True/False if
+    determinable, otherwise None.
+    """
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"} if OPENROUTER_API_KEY else {}
+    try:
+        resp = await client.get(OPENROUTER_MODELS_URL, headers=headers, timeout=timeout)
+    except Exception as exc:
+        log.info("Could not fetch OpenRouter models: %s", type(exc).__name__)
+        return None, None
+
+    if resp.status_code != 200:
+        log.info("OpenRouter models endpoint returned status %s", resp.status_code)
+        return None, None
+
+    try:
+        j = resp.json()
+    except Exception:
+        log.info("Invalid JSON from OpenRouter models endpoint")
+        return None, None
+
+    data = j.get("data") or j.get("models") or []
+    if not isinstance(data, list):
+        return None, None
+
+    # Try to match model by id or name
+    target = model_name.lower()
+    for m in data:
+        mid = (m.get("id") or "").lower()
+        name = (m.get("name") or "").lower()
+        desc = (m.get("description") or "").lower()
+        if target == mid or target in mid or target in name or target in desc:
+            # Determine vision support from fields if possible
+            # Some providers include 'modalities' or 'input' fields
+            modalities = m.get("modalities") or m.get("input") or m.get("capabilities")
+            if isinstance(modalities, list):
+                has_vision = any("image" in str(x).lower() or "vision" in str(x).lower() for x in modalities)
+                return m, bool(has_vision)
+            # Fallback: look at description or name for hints
+            if any(k in name or k in desc for k in ("vision", "image", "multimodal", "flash", "gemini")):
+                return m, True
+            return m, False
+
+    return None, None
 
 
 async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
@@ -343,6 +390,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\nModel: {MODEL}"
             f"\nActive conversations: {len(sessions)}"
         )
+        # model capability if known
+        ms = context.application.bot_data.get("model_supports_vision")
+        if ms is True:
+            text += "\nModel vision: yes"
+        elif ms is False:
+            text += "\nModel vision: no"
+        else:
+            text += "\nModel vision: unknown"
     await safe_reply(update, text)
 
 
@@ -416,8 +471,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Handle image download (if any)
     if photo or doc:
-        # Check model capability
-        if not model_supports_vision(MODEL):
+        # Check model capability: prefer authoritative info if available
+        ms = context.application.bot_data.get("model_supports_vision")
+        if ms is None:
+            # not known: try to fetch now (best-effort)
+            try:
+                info, cap = await get_model_capability(context.application.bot_data["http"], MODEL)
+                context.application.bot_data["model_info"] = info
+                context.application.bot_data["model_supports_vision"] = cap if cap is not None else model_supports_vision_heuristic(MODEL)
+                ms = context.application.bot_data["model_supports_vision"]
+            except Exception:
+                ms = model_supports_vision_heuristic(MODEL)
+        if not ms:
             await safe_reply(update, "The currently selected model does not support image analysis. Please send a text description instead or ask the administrator to select a vision-capable model.")
             return
 
@@ -533,6 +598,14 @@ async def cleanup_loop():
 
 async def post_init(app: Application):
     app.bot_data["http"] = httpx.AsyncClient()
+    # Attempt to fetch model capability once at startup (best-effort, short timeout)
+    try:
+        info, cap = await get_model_capability(app.bot_data["http"], MODEL)
+        app.bot_data["model_info"] = info
+        app.bot_data["model_supports_vision"] = cap if cap is not None else model_supports_vision_heuristic(MODEL)
+        log.info("Model capability loaded: vision=%s", app.bot_data.get("model_supports_vision"))
+    except Exception:
+        app.bot_data["model_supports_vision"] = model_supports_vision_heuristic(MODEL)
     app.bot_data["cleanup"] = asyncio.create_task(cleanup_loop())
     log.info("%s started", BOT_NAME)
 
@@ -548,6 +621,10 @@ async def post_shutdown(app: Application):
 
 # ------------------------------------------------------------------- main
 def main():
+    if not BOT_TOKEN or not OPENROUTER_API_KEY:
+        log.error("BOT_TOKEN and OPENROUTER_API_KEY environment variables are required.")
+        sys.exit(1)
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
