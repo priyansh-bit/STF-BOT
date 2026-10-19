@@ -712,9 +712,10 @@ def main():
     app.add_handler(MessageHandler(private & filters.Document.IMAGE, on_message))
 
     # For group chats: use generic handlers and early-exit unless mentioned/replied
-    app.add_handler(MessageHandler(filters.Group() & filters.TEXT & ~filters.COMMAND, on_message))
-    app.add_handler(MessageHandler(filters.Group() & filters.PHOTO, on_message))
-    app.add_handler(MessageHandler(filters.Group() & filters.Document.IMAGE, on_message))
+    group_chats = filters.ChatType.GROUP | filters.ChatType.SUPERGROUP
+    app.add_handler(MessageHandler(group_chats & filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(group_chats & filters.PHOTO, on_message))
+    app.add_handler(MessageHandler(group_chats & filters.Document.IMAGE, on_message))
 
     app.add_handler(MessageHandler(private & filters.COMMAND, on_unknown_command))
 
