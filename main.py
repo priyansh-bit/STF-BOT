@@ -5,6 +5,8 @@ Support-only bot. Conversation context lives in RAM only and expires after
 """
 
 import asyncio
+import base64
+import io
 import logging
 import os
 import re
@@ -12,6 +14,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 from telegram import Update
@@ -155,41 +158,141 @@ class AIError(Exception):
     pass
 
 
-async def ask_ai(client: httpx.AsyncClient, messages: list) -> str:
+def model_supports_vision(model_name: str) -> bool:
+    """Best-effort heuristic to determine whether the configured model supports
+    image/vision inputs. We avoid calling additional APIs at startup to keep the
+    code simple and resilient; if this heuristic is wrong the request will fail
+    and be reported back to the user.
+    """
+    n = model_name.lower()
+    keys = ["vl", "vision", "gemini", "flash", "multimodal", "image", "img"]
+    return any(k in n for k in keys)
+
+
+async def ask_ai(client: httpx.AsyncClient, messages: list[Any]) -> str:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {"model": MODEL, "messages": messages, "max_tokens": 400}
+    payload = {"model": MODEL, "messages": messages, "max_tokens": 600}
 
+    max_retries = 4
+    backoff = 1.0
     last_error = "unknown"
-    for _ in range(2):
+
+    for attempt in range(1, max_retries + 1):
         try:
-            resp = await client.post(
-                OPENROUTER_URL, headers=headers, json=payload, timeout=60
-            )
+            resp = await client.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
         except httpx.TimeoutException:
             last_error = "timeout"
+            log.info("OpenRouter timeout on attempt %d", attempt)
+            # retry on timeout
+            await asyncio.sleep(backoff)
+            backoff *= 2
             continue
         except httpx.HTTPError as exc:
             last_error = type(exc).__name__
+            log.warning("HTTP error contacting OpenRouter: %s", last_error)
+            await asyncio.sleep(backoff)
+            backoff *= 2
             continue
 
-        if resp.status_code == 200:
+        status = resp.status_code
+        if status == 200:
             try:
-                content = resp.json()["choices"][0]["message"].get("content")
-            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-                last_error = "bad response format"
+                data = resp.json()
+            except ValueError:
+                last_error = "invalid-json"
+                log.warning("OpenRouter returned invalid JSON")
+                await asyncio.sleep(backoff)
+                backoff *= 2
                 continue
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-            last_error = "empty response"
+
+            # Expecting choices -> message -> content
+            try:
+                choices = data.get("choices")
+                if not choices:
+                    last_error = "empty choices"
+                    log.info("OpenRouter returned empty choices")
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                msg = choices[0].get("message")
+                if not msg:
+                    last_error = "missing message"
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                content = msg.get("content")
+            except Exception:
+                last_error = "bad response format"
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+
+            # content may be a string, or a list of content objects for multimodal
+            if isinstance(content, str):
+                if content.strip():
+                    return content.strip()
+                last_error = "empty response"
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+
+            if isinstance(content, list):
+                # collect text pieces
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        t = item.get("text") or item.get("content")
+                        if t:
+                            parts.append(t.strip())
+                    elif isinstance(item, dict) and item.get("type") == "image":
+                        # The model returned an image as output; we won't forward binary
+                        parts.append("[image output omitted]")
+                if parts:
+                    return "\n\n".join(parts).strip()
+                last_error = "no text parts in content"
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+
+            last_error = "unknown content type"
+            await asyncio.sleep(backoff)
+            backoff *= 2
             continue
 
-        last_error = f"HTTP {resp.status_code}"
-        if resp.status_code in (401, 402, 403, 404):
-            break  # retrying will not help
-        await asyncio.sleep(2)  # 429 / 5xx: short wait then one retry
+        # Non-200 handling
+        last_error = f"HTTP {status}"
+        if status in (401, 402, 403, 404):
+            # Permanent authorization / model not found errors: do not retry
+            log.error("OpenRouter permanent error: %s", last_error)
+            break
+
+        if status == 429:
+            # Rate limited - retry with backoff
+            retry_after = 0
+            try:
+                j = resp.json()
+                retry_after = j.get("retry_after", 0)
+            except Exception:
+                pass
+            wait = max(backoff, retry_after)
+            log.info("OpenRouter rate limited (429). Waiting %.1fs before retry", wait)
+            await asyncio.sleep(wait)
+            backoff *= 2
+            continue
+
+        if 500 <= status < 600:
+            # Server error: retry
+            log.info("OpenRouter server error %s; attempt %d", status, attempt)
+            await asyncio.sleep(backoff)
+            backoff *= 2
+            continue
+
+        # Other codes: don't retry
+        log.warning("OpenRouter unexpected status %s", status)
+        break
 
     raise AIError(last_error)
 
@@ -201,8 +304,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Welcome to {BOT_NAME}! 🛟\n\n"
         "I can help with support questions and guide you to the right place "
         "if I can't solve something myself.\n\n"
-        "Describe your issue in a message. For your safety, never send "
-        "passwords, OTPs, PINs or API keys here.\n\n"
+        "Describe your issue in a message or send a screenshot with a caption. "
+        "For your safety, never send passwords, OTPs, PINs or API keys here.\n\n"
         "Type /help to see commands.",
     )
 
@@ -215,7 +318,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - this message\n"
         "/clear - erase our current conversation\n"
         "/status - check if the bot is online\n\n"
-        "Just write your support question as a normal message.\n"
+        "Just write your support question as a normal message, or send a screenshot.\n"
         "Your conversation is kept in memory only and is erased after "
         "5 minutes of inactivity.\n"
         "I cannot access your account or confirm that an issue is resolved. "
@@ -249,24 +352,45 @@ async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ------------------------------------------------------------ chat handler
 async def on_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply(update, "I can only read text messages. Please describe your issue in text.")
+    await safe_reply(update, "I can only read text messages. Please describe your issue in text or send a screenshot with a caption.")
+
+
+async def build_user_message_for_openrouter(text: str | None, image_data_url: str | None):
+    """Return a message content structure compatible with OpenRouter when
+    including optional image data. If only text is provided, returns the text
+    as a simple string to preserve backwards compatibility.
+    """
+    if image_data_url:
+        # multimodal content array: text first (if any), then image_url
+        content = []
+        if text:
+            content.append({"type": "text", "text": text})
+        content.append({"type": "image_url", "image_url": {"url": image_data_url}})
+        return content
+    return text or ""
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text or not update.effective_user:
+    if not update.message or not update.effective_user:
         return
     user_id = update.effective_user.id
-    text = update.message.text.strip()
-    if not text:
-        return
 
+    # Rate limiting
     if rate_limited(user_id):
         await safe_reply(update, "You're sending messages too fast. Please wait a minute and try again.")
         return
 
-    if len(text) > MAX_INPUT_CHARS:
-        await safe_reply(update, f"Message too long. Please keep it under {MAX_INPUT_CHARS} characters.")
-        return
+    # Determine if the message contains text and/or an image
+    text = (update.message.text or update.message.caption or "").strip()
+    photo = None
+    doc = None
+    image_data_url = None
+
+    if update.message.photo:
+        # take the highest-resolution photo
+        photo = update.message.photo[-1]
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image"):
+        doc = update.message.document
 
     if contains_secret(text):
         await safe_reply(
@@ -277,16 +401,65 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if not text and not photo and not doc:
+        await safe_reply(update, "Please describe your support issue in text, or send a screenshot with a caption.")
+        return
+
+    if len(text) > MAX_INPUT_CHARS:
+        await safe_reply(update, f"Message too long. Please keep it under {MAX_INPUT_CHARS} characters.")
+        return
+
     session = get_session(user_id)
     if session.lock.locked():
         await safe_reply(update, "Still working on your previous message. Please wait a moment.")
         return
 
+    # Handle image download (if any)
+    if photo or doc:
+        # Check model capability
+        if not model_supports_vision(MODEL):
+            await safe_reply(update, "The currently selected model does not support image analysis. Please send a text description instead or ask the administrator to select a vision-capable model.")
+            return
+
+        file = await (photo.get_file() if photo else doc.get_file())
+        # file.file_size may be None for some types; we'll enforce a conservative cap
+        max_bytes = 5 * 1024 * 1024  # 5 MB
+        if getattr(file, "file_size", 0) and file.file_size > max_bytes:
+            await safe_reply(update, "Image too large. Please resize or send a smaller screenshot (under 5 MB).")
+            return
+
+        # download into memory with a timeout
+        try:
+            bio = io.BytesIO()
+            await file.download(out=bio)
+            bio.seek(0)
+            data = bio.read()
+            if len(data) > max_bytes:
+                await safe_reply(update, "Image too large after download. Please send a smaller image.")
+                return
+            mime = "image/jpeg"
+            # try to detect JPEG/PNG via header
+            if data.startswith(b"\x89PNG"):
+                mime = "image/png"
+            b64 = base64.b64encode(data).decode("ascii")
+            image_data_url = f"data:{mime};base64,{b64}"
+        except Exception:
+            log.warning("Failed to download image from Telegram; skipping image")
+            await safe_reply(update, "I couldn't download your image. Please try again.")
+            return
+
     async with session.lock:
-        session.history.append({"role": "user", "content": text})
+        # Store only textual placeholders in history to avoid keeping binary data in RAM
+        placeholder = text or "[screenshot]"
+        session.history.append({"role": "user", "content": placeholder})
         session.history = session.history[-MAX_HISTORY:]
         session.last_active = time.time()
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + session.history
+
+        # Build messages for OpenRouter
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Build combined user content: if image present, use multimodal structure
+        user_content = await build_user_message_for_openrouter(text, image_data_url)
+        messages.append({"role": "user", "content": user_content})
 
         try:
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
@@ -298,11 +471,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except AIError as exc:
             log.error("AI request failed: %s", exc)
             session.history.pop()  # drop the unanswered message
-            await safe_reply(
-                update,
-                "Sorry, I can't answer right now. Please try again shortly, "
-                f"or contact the official {BOT_NAME} administrator.",
-            )
+            # Provide user-friendly and specific guidance where possible
+            err = str(exc)
+            if "429" in err or "rate" in err.lower():
+                await safe_reply(
+                    update,
+                    "The AI service is temporarily rate-limited. Please wait a minute and try again."
+                )
+            elif "404" in err or "not found" in err.lower():
+                await safe_reply(
+                    update,
+                    "The configured AI model could not be found. Please contact the administrator to verify the OPENROUTER_MODEL setting."
+                )
+            elif "401" in err or "403" in err:
+                await safe_reply(
+                    update,
+                    "Authentication to the AI service failed. Please notify the administrator."
+                )
+            else:
+                await safe_reply(
+                    update,
+                    "Sorry, I can't answer right now. Please try again shortly, or contact the official " + BOT_NAME + " administrator."
+                )
             return
 
         session.history.append({"role": "assistant", "content": reply})
@@ -314,7 +504,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Log only the exception type: no stack trace, no message content.
-    log.error("Unhandled error: %s", type(context.error).__name__)
+    name = type(context.error).__name__ if context.error else "Unknown"
+    log.error("Unhandled error: %s", name)
+    # If the error indicates polling / instance conflicts, give a clear admin log
+    if name == "Conflict":
+        log.warning("A 'Conflict' error often means multiple bot instances or replicas are running. Ensure only one Railway worker/replica runs this bot.")
 
 
 # ------------------------------------------------------- background tasks
@@ -367,8 +561,12 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help, filters=private))
     app.add_handler(CommandHandler("clear", cmd_clear, filters=private))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
+    # Accept text, captions, photos and image documents as support input
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(private & filters.PHOTO, on_message))
+    app.add_handler(MessageHandler(private & filters.Document.IMAGE, on_message))
     app.add_handler(MessageHandler(private & filters.COMMAND, on_unknown_command))
+    # Any other non-text updates get a helpful note
     app.add_handler(
         MessageHandler(
             private & ~filters.TEXT & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
@@ -377,6 +575,9 @@ def main():
     )
     app.add_error_handler(on_error)
 
+    # Only call polling once per process. If you deploy multiple Railway replicas,
+    # each will start its own polling instance; set replicas to 1 in Railway to
+    # avoid Telegram 'Conflict' errors.
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
